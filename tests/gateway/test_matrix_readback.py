@@ -154,3 +154,57 @@ async def test_readback_happy_path_text():
     assert voice_kwargs["chat_id"] == "!room:example.org"
     # In-flight set is cleared after completion
     assert "$parent_msg" not in adapter._readback_in_flight
+
+
+@pytest.mark.asyncio
+async def test_dispatch_skip_when_flag_disabled():
+    """Case 2: flag off → no readback even if 🔊."""
+    adapter = _make_adapter(readback_enabled=False)
+    adapter._is_self_sender = MagicMock(return_value=False)
+    adapter._is_duplicate_event = MagicMock(return_value=False)
+    adapter._handle_readback_reaction = AsyncMock()
+    event = _make_reaction_event(key="🔊")
+    await adapter._on_reaction(event)
+    adapter._handle_readback_reaction.assert_not_awaited()
+    adapter._send_reaction.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_skip_when_wrong_emoji():
+    """Case 3: flag on but emoji is 🔉 → fall through, no readback."""
+    adapter = _make_adapter(readback_enabled=True)
+    adapter._is_self_sender = MagicMock(return_value=False)
+    adapter._is_duplicate_event = MagicMock(return_value=False)
+    adapter._handle_readback_reaction = AsyncMock()
+    event = _make_reaction_event(key="🔉")
+    await adapter._on_reaction(event)
+    adapter._handle_readback_reaction.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_skip_when_self_sender():
+    """Case 4: bot's own 🔊 reaction → silent drop."""
+    adapter = _make_adapter(readback_enabled=True)
+    adapter._is_self_sender = MagicMock(return_value=True)
+    adapter._is_duplicate_event = MagicMock(return_value=False)
+    adapter._handle_readback_reaction = AsyncMock()
+    event = _make_reaction_event(key="🔊", sender="@coordinator:example.org")
+    await adapter._on_reaction(event)
+    adapter._handle_readback_reaction.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_skip_when_approval_prompt_parent():
+    """Case 5: parent is a pending approval prompt → approval flow only."""
+    adapter = _make_adapter(readback_enabled=True)
+    adapter._is_self_sender = MagicMock(return_value=False)
+    adapter._is_duplicate_event = MagicMock(return_value=False)
+    adapter._handle_readback_reaction = AsyncMock()
+    # Insert a fake approval prompt keyed by the parent event id
+    fake_prompt = MagicMock(resolved=False, chat_id="!room:example.org")
+    adapter._approval_prompts_by_event["$parent_msg"] = fake_prompt
+    # Use a key that approval flow recognises (e.g. ✅) so it doesn't
+    # short-circuit on key mismatch.
+    event = _make_reaction_event(key="✅")
+    await adapter._on_reaction(event)
+    adapter._handle_readback_reaction.assert_not_awaited()

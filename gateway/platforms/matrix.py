@@ -2277,6 +2277,21 @@ class MatrixAdapter(BasePlatformAdapter):
                 room_id,
             )
 
+            # ----- TTS readback dispatch (🔊 → voice reply) ---------------
+            # Spec: matrix-hive docs/superpowers/specs/2026-05-18-tts-readback-design.md §5.2
+            if self._readback_enabled and key == self._readback_emoji:
+                # Don't collide with approval-prompt flow (covered below).
+                approval = self._approval_prompts_by_event.get(reacts_to)
+                if approval is None or approval.resolved:
+                    import asyncio as _asyncio
+                    _asyncio.create_task(
+                        self._handle_readback_reaction(
+                            room_id, reacts_to, sender
+                        )
+                    )
+                    return
+            # -----------------------------------------------------------------
+
             # Check if this reaction resolves a pending approval prompt.
             prompt = self._approval_prompts_by_event.get(reacts_to)
             if prompt and not prompt.resolved:
