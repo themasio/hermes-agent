@@ -359,3 +359,25 @@ async def test_truncation_at_max_chars_adds_marker_reaction():
     adapter._send_reaction.assert_any_await(
         "!room:example.org", "$parent_msg", "📏"
     )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_readback_same_parent_only_runs_once():
+    """Case 10: second 🔊 on same parent while in-flight → silent no-op."""
+    adapter = _make_adapter(readback_enabled=True)
+    adapter._client.get_event = AsyncMock(
+        return_value=_make_text_event(body="hello")
+    )
+    with patch(
+        "gateway.platforms.matrix.text_to_speech_tool",
+        return_value={"file_path": "/tmp/test.ogg", "duration_ms": 1234},
+    ), patch("os.unlink"):
+        # Pre-fill the lock to simulate a concurrent caller already running.
+        adapter._readback_in_flight.add("$parent_msg")
+        await adapter._handle_readback_reaction(
+            "!room:example.org", "$parent_msg", "@alice:example.org"
+        )
+        # The second call must be a silent no-op while the lock is held.
+        adapter.send_voice.assert_not_awaited()
+    # Lock state should be untouched after the no-op early return.
+    assert "$parent_msg" in adapter._readback_in_flight

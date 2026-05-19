@@ -2179,12 +2179,21 @@ class MatrixAdapter(BasePlatformAdapter):
         import os
         import tempfile
 
+        # Concurrent guard: if a readback for this parent is already in
+        # flight, second caller is a silent no-op.
+        if parent_event_id in self._readback_in_flight:
+            logger.debug(
+                "matrix.readback: skip in-flight parent=%s sender=%s",
+                parent_event_id, sender,
+            )
+            return
+
         # 6a. Ack 👂 on the parent so user sees us working.
         ack_event_id = await self._send_reaction(
             room_id, parent_event_id, "👂"
         )
 
-        # 6b. In-flight lock (concurrent guard expanded in Task 8).
+        # 6b. Acquire the lock before doing work; finally discards it.
         self._readback_in_flight.add(parent_event_id)
         audio_path = None
         try:
