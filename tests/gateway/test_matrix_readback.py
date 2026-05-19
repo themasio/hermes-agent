@@ -131,7 +131,7 @@ async def test_readback_happy_path_text():
     ) as tts_mock, patch(
         "gateway.platforms.matrix._strip_markdown_for_tts",
         side_effect=lambda t: t,
-    ), patch("os.unlink"):
+    ), patch("os.unlink"), patch("os.path.getsize", return_value=1234):
         await adapter._handle_readback_reaction(
             room_id="!room:example.org",
             parent_event_id="$parent_msg",
@@ -243,7 +243,7 @@ async def test_extract_image_with_caption_reads_caption():
     with patch(
         "gateway.platforms.matrix.text_to_speech_tool",
         return_value=fake_tts_result,
-    ) as tts_mock, patch("os.unlink"):
+    ) as tts_mock, patch("os.unlink"), patch("os.path.getsize", return_value=1234):
         await adapter._handle_readback_reaction(
             "!room:example.org", "$parent_msg", "@alice:example.org"
         )
@@ -302,7 +302,7 @@ async def test_extract_html_formatted_body_strips_tags():
     ) as tts_mock, patch(
         "gateway.platforms.matrix._strip_markdown_for_tts",
         side_effect=lambda t: t,
-    ), patch("os.unlink"):
+    ), patch("os.unlink"), patch("os.path.getsize", return_value=1234):
         await adapter._handle_readback_reaction(
             "!room:example.org", "$parent_msg", "@alice:example.org"
         )
@@ -325,7 +325,7 @@ async def test_markdown_stripped_before_tts(monkeypatch):
     with patch(
         "gateway.platforms.matrix.text_to_speech_tool",
         return_value=fake_tts_result,
-    ) as tts_mock, patch("os.unlink"):
+    ) as tts_mock, patch("os.unlink"), patch("os.path.getsize", return_value=1234):
         await adapter._handle_readback_reaction(
             "!room:example.org", "$parent_msg", "@alice:example.org"
         )
@@ -348,7 +348,7 @@ async def test_truncation_at_max_chars_adds_marker_reaction():
     with patch(
         "gateway.platforms.matrix.text_to_speech_tool",
         return_value=fake_tts_result,
-    ) as tts_mock, patch("os.unlink"):
+    ) as tts_mock, patch("os.unlink"), patch("os.path.getsize", return_value=1234):
         await adapter._handle_readback_reaction(
             "!room:example.org", "$parent_msg", "@alice:example.org"
         )
@@ -381,3 +381,85 @@ async def test_concurrent_readback_same_parent_only_runs_once():
         adapter.send_voice.assert_not_awaited()
     # Lock state should be untouched after the no-op early return.
     assert "$parent_msg" in adapter._readback_in_flight
+
+
+@pytest.mark.asyncio
+async def test_error_parent_redacted_silent():
+    """Case 6: get_event raises → redact 👂, no ⚠️, no send_voice."""
+    adapter = _make_adapter(readback_enabled=True)
+    adapter._client.get_event = AsyncMock(side_effect=Exception("EventNotFound"))
+    await adapter._handle_readback_reaction(
+        "!room:example.org", "$parent_msg", "@alice:example.org"
+    )
+    adapter._redact_reaction.assert_any_await(
+        "!room:example.org", "$ack_event"
+    )
+    adapter.send_voice.assert_not_awaited()
+    # No ⚠️ added — silent for redacted
+    for call in adapter._send_reaction.await_args_list:
+        assert call.args[2] != "⚠️"
+
+
+@pytest.mark.asyncio
+async def test_error_empty_body_adds_warning():
+    """Case 7: parent body is whitespace → redact 👂, ⚠️, text reply."""
+    adapter = _make_adapter(readback_enabled=True)
+    adapter._client.get_event = AsyncMock(
+        return_value=_make_text_event(body="   ")
+    )
+    await adapter._handle_readback_reaction(
+        "!room:example.org", "$parent_msg", "@alice:example.org"
+    )
+    adapter._redact_reaction.assert_any_await(
+        "!room:example.org", "$ack_event"
+    )
+    adapter._send_reaction.assert_any_await(
+        "!room:example.org", "$parent_msg", "⚠️"
+    )
+    adapter.send_message.assert_awaited()
+    args, kwargs = adapter.send_message.call_args
+    msg = args[1] if len(args) > 1 else kwargs.get("text", "")
+    assert "empty" in msg.lower() or "no text" in msg.lower()
+
+
+@pytest.mark.asyncio
+async def test_error_tts_timeout_adds_warning():
+    """Case 9: TTS exceeds readback_timeout_seconds → ⚠️ + log error."""
+    adapter = _make_adapter(readback_enabled=True, timeout=1)
+    adapter._client.get_event = AsyncMock(
+        return_value=_make_text_event(body="hello")
+    )
+    with patch(
+        "gateway.platforms.matrix.asyncio.to_thread",
+        new=AsyncMock(side_effect=asyncio.TimeoutError()),
+    ):
+        await adapter._handle_readback_reaction(
+            "!room:example.org", "$parent_msg", "@alice:example.org"
+        )
+    adapter._send_reaction.assert_any_await(
+        "!room:example.org", "$parent_msg", "⚠️"
+    )
+    adapter.send_voice.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_error_send_voice_upload_403():
+    """Case 15: send_voice fails → ⚠️ + 'upload failed' text reply."""
+    adapter = _make_adapter(readback_enabled=True)
+    adapter._client.get_event = AsyncMock(
+        return_value=_make_text_event(body="hello")
+    )
+    adapter.send_voice = AsyncMock(
+        side_effect=Exception("403 Forbidden: no permission to upload")
+    )
+    with patch(
+        "gateway.platforms.matrix.text_to_speech_tool",
+        return_value={"file_path": "/tmp/test.ogg", "duration_ms": 1234},
+    ), patch("os.unlink"), patch("os.path.getsize", return_value=1234):
+        await adapter._handle_readback_reaction(
+            "!room:example.org", "$parent_msg", "@alice:example.org"
+        )
+    adapter._send_reaction.assert_any_await(
+        "!room:example.org", "$parent_msg", "⚠️"
+    )
+    adapter.send_message.assert_awaited()

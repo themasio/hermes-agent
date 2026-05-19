@@ -2164,6 +2164,36 @@ class MatrixAdapter(BasePlatformAdapter):
             return None, "empty after stripping"
         return text, None
 
+    async def _post_readback_error(
+        self,
+        room_id: str,
+        parent_event_id: str,
+        ack_event_id: Optional[str],
+        reason: str,
+        *,
+        silent: bool = False,
+    ) -> None:
+        """Common error tail: redact 👂 ack; if not silent, add ⚠️ + text reply."""
+        if ack_event_id:
+            try:
+                await self._redact_reaction(room_id, ack_event_id)
+            except Exception:
+                logger.debug("matrix.readback: redact-ack failed", exc_info=True)
+        if silent:
+            return
+        try:
+            await self._send_reaction(room_id, parent_event_id, "⚠️")
+        except Exception:
+            logger.debug("matrix.readback: warn-react failed", exc_info=True)
+        try:
+            await self.send_message(
+                room_id,
+                f"⚠️ readback failed: {reason}",
+                reply_to=parent_event_id,
+            )
+        except Exception:
+            logger.debug("matrix.readback: warn-text-reply failed", exc_info=True)
+
     async def _handle_readback_reaction(
         self,
         room_id: str,
@@ -2172,15 +2202,11 @@ class MatrixAdapter(BasePlatformAdapter):
     ) -> None:
         """Fetch parent event, TTS its body, post as voice reply.
 
-        See matrix-hive docs/superpowers/specs/2026-05-18-tts-readback-design.md.
-
-        Happy path only at this stage; failure paths added in later tasks.
+        Spec: matrix-hive docs/superpowers/specs/2026-05-18-tts-readback-design.md
         """
         import os
         import tempfile
 
-        # Concurrent guard: if a readback for this parent is already in
-        # flight, second caller is a silent no-op.
         if parent_event_id in self._readback_in_flight:
             logger.debug(
                 "matrix.readback: skip in-flight parent=%s sender=%s",
@@ -2188,33 +2214,41 @@ class MatrixAdapter(BasePlatformAdapter):
             )
             return
 
-        # 6a. Ack 👂 on the parent so user sees us working.
         ack_event_id = await self._send_reaction(
             room_id, parent_event_id, "👂"
         )
-
-        # 6b. Acquire the lock before doing work; finally discards it.
         self._readback_in_flight.add(parent_event_id)
         audio_path = None
         try:
-            # 6c. Fetch the parent event.
-            evt = await self._client.get_event(room_id, parent_event_id)
-
-            # 6d. Extract body via msgtype-aware helper.
-            text, skip_reason = self._extract_readback_text(evt)
-            if text is None:
-                # Silent vs user-visible handled by caller policy in Task 9.
-                # For now, just redact ack and return.
-                if ack_event_id:
-                    await self._redact_reaction(room_id, ack_event_id)
+            # 6c. Fetch parent event.
+            try:
+                evt = await self._client.get_event(room_id, parent_event_id)
+            except Exception as exc:
+                logger.warning(
+                    "matrix.readback: get_event failed parent=%s: %s",
+                    parent_event_id, exc,
+                )
+                await self._post_readback_error(
+                    room_id, parent_event_id, ack_event_id,
+                    reason="parent unavailable", silent=True,
+                )
                 return
 
-            # Truncate at sentence boundary if body too long.
+            # 6d. Extract.
+            text, skip_reason = self._extract_readback_text(evt)
+            if text is None:
+                await self._post_readback_error(
+                    room_id, parent_event_id, ack_event_id,
+                    reason=skip_reason or "no text",
+                    silent=(skip_reason == "silent"),
+                )
+                return
+
+            # Truncate at sentence boundary if too long.
             if len(text) > self._readback_max_chars:
                 original_len = len(text)
-                cap = self._readback_max_chars - 40  # room for marker suffix
+                cap = self._readback_max_chars - 40
                 cut = text[:cap]
-                # Try to cut at last sentence end within window.
                 last_end = max(
                     cut.rfind(". "), cut.rfind("? "), cut.rfind("! ")
                 )
@@ -2223,22 +2257,76 @@ class MatrixAdapter(BasePlatformAdapter):
                 text = f"{cut.rstrip()} … [truncated, {original_len} chars]"
                 await self._send_reaction(room_id, parent_event_id, "📏")
 
-            # 6e. TTS into a temp ogg file.
+            # 6e. TTS with timeout.
             with tempfile.NamedTemporaryFile(
                 suffix=".ogg", delete=False
             ) as tmp:
                 output_path = tmp.name
-            result = text_to_speech_tool(text=text, output_path=output_path)
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        text_to_speech_tool,
+                        text=text,
+                        output_path=output_path,
+                    ),
+                    timeout=self._readback_timeout_secs,
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    "matrix.readback: TTS timeout parent=%s after %ds",
+                    parent_event_id, self._readback_timeout_secs,
+                )
+                await self._post_readback_error(
+                    room_id, parent_event_id, ack_event_id,
+                    reason="TTS timeout",
+                )
+                return
+            except Exception as exc:
+                logger.error(
+                    "matrix.readback: TTS error parent=%s: %s",
+                    parent_event_id, exc,
+                )
+                await self._post_readback_error(
+                    room_id, parent_event_id, ack_event_id,
+                    reason=f"TTS error: {exc}",
+                )
+                return
+
             audio_path = result.get("file_path", output_path)
 
+            # Empty-audio guard.
+            try:
+                if not audio_path or os.path.getsize(audio_path) == 0:
+                    await self._post_readback_error(
+                        room_id, parent_event_id, ack_event_id,
+                        reason="TTS produced empty audio",
+                    )
+                    return
+            except OSError:
+                await self._post_readback_error(
+                    room_id, parent_event_id, ack_event_id,
+                    reason="TTS produced empty audio",
+                )
+                return
+
             # 6f. Send as voice reply.
-            await self.send_voice(
-                chat_id=room_id,
-                audio_path=audio_path,
-                reply_to=parent_event_id,
-            )
+            try:
+                await self.send_voice(
+                    chat_id=room_id,
+                    audio_path=audio_path,
+                    reply_to=parent_event_id,
+                )
+            except Exception as exc:
+                logger.error(
+                    "matrix.readback: send_voice failed parent=%s: %s",
+                    parent_event_id, exc,
+                )
+                await self._post_readback_error(
+                    room_id, parent_event_id, ack_event_id,
+                    reason="upload failed",
+                )
+                return
         finally:
-            # 6g. Cleanup.
             self._readback_in_flight.discard(parent_event_id)
             if audio_path:
                 try:
