@@ -195,16 +195,35 @@ async def test_dispatch_skip_when_self_sender():
 
 @pytest.mark.asyncio
 async def test_dispatch_skip_when_approval_prompt_parent():
-    """Case 5: parent is a pending approval prompt → approval flow only."""
+    """Case 5: parent is an unresolved approval prompt → in-branch guard
+    blocks readback even when key=🔊. Approval flow handles the parent."""
     adapter = _make_adapter(readback_enabled=True)
     adapter._is_self_sender = MagicMock(return_value=False)
     adapter._is_duplicate_event = MagicMock(return_value=False)
     adapter._handle_readback_reaction = AsyncMock()
-    # Insert a fake approval prompt keyed by the parent event id
+    # Insert an unresolved approval prompt keyed by the parent event id.
     fake_prompt = MagicMock(resolved=False, chat_id="!room:example.org")
     adapter._approval_prompts_by_event["$parent_msg"] = fake_prompt
-    # Use a key that approval flow recognises (e.g. ✅) so it doesn't
-    # short-circuit on key mismatch.
-    event = _make_reaction_event(key="✅")
+    # Key IS 🔊 — readback branch is entered, but the in-branch approval
+    # check (`approval is None or approval.resolved`) is False, so we
+    # fall through to the existing approval flow without dispatching.
+    event = _make_reaction_event(key="🔊")
     await adapter._on_reaction(event)
+    await asyncio.sleep(0)
     adapter._handle_readback_reaction.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_invokes_handler_on_speaker_emoji():
+    """Positive: flag on + 🔊 + non-self + no-approval-parent → handler IS awaited."""
+    adapter = _make_adapter(readback_enabled=True)
+    adapter._is_self_sender = MagicMock(return_value=False)
+    adapter._is_duplicate_event = MagicMock(return_value=False)
+    adapter._handle_readback_reaction = AsyncMock()
+    event = _make_reaction_event(key="🔊")
+    await adapter._on_reaction(event)
+    # _on_reaction uses asyncio.create_task — yield once so the task runs.
+    await asyncio.sleep(0)
+    adapter._handle_readback_reaction.assert_awaited_once_with(
+        "!room:example.org", "$parent_msg", "@alice:example.org"
+    )
