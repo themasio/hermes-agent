@@ -2200,6 +2200,20 @@ class MatrixAdapter(BasePlatformAdapter):
                     await self._redact_reaction(room_id, ack_event_id)
                 return
 
+            # Truncate at sentence boundary if body too long.
+            if len(text) > self._readback_max_chars:
+                original_len = len(text)
+                cap = self._readback_max_chars - 40  # room for marker suffix
+                cut = text[:cap]
+                # Try to cut at last sentence end within window.
+                last_end = max(
+                    cut.rfind(". "), cut.rfind("? "), cut.rfind("! ")
+                )
+                if last_end > cap * 0.5:
+                    cut = cut[: last_end + 1]
+                text = f"{cut.rstrip()} … [truncated, {original_len} chars]"
+                await self._send_reaction(room_id, parent_event_id, "📏")
+
             # 6e. TTS into a temp ogg file.
             with tempfile.NamedTemporaryFile(
                 suffix=".ogg", delete=False

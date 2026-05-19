@@ -334,3 +334,28 @@ async def test_markdown_stripped_before_tts(monkeypatch):
     assert "](" not in tts_text   # markdown link syntax gone
     assert "bold" in tts_text
     assert "link" in tts_text
+
+
+@pytest.mark.asyncio
+async def test_truncation_at_max_chars_adds_marker_reaction():
+    """Case 8: body > readback_max_chars → truncated + 📏 reaction."""
+    adapter = _make_adapter(readback_enabled=True, max_chars=2000)
+    long_body = ("This is one sentence. " * 200)  # ~4400 chars
+    adapter._client.get_event = AsyncMock(
+        return_value=_make_text_event(body=long_body)
+    )
+    fake_tts_result = {"file_path": "/tmp/test.ogg", "duration_ms": 1234}
+    with patch(
+        "gateway.platforms.matrix.text_to_speech_tool",
+        return_value=fake_tts_result,
+    ) as tts_mock, patch("os.unlink"):
+        await adapter._handle_readback_reaction(
+            "!room:example.org", "$parent_msg", "@alice:example.org"
+        )
+    tts_text = tts_mock.call_args.kwargs["text"]
+    assert len(tts_text) <= 2050  # max + truncation marker suffix
+    assert "truncated" in tts_text.lower()
+    # 📏 added on parent
+    adapter._send_reaction.assert_any_await(
+        "!room:example.org", "$parent_msg", "📏"
+    )
