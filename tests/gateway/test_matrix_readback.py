@@ -310,3 +310,27 @@ async def test_extract_html_formatted_body_strips_tags():
     text = tts_mock.call_args.kwargs["text"]
     assert "<b>" not in text and "</b>" not in text
     assert "raw body link" in text or "raw body" in text
+
+
+@pytest.mark.asyncio
+async def test_markdown_stripped_before_tts(monkeypatch):
+    """Case 11: bold/link markdown removed before TTS."""
+    adapter = _make_adapter(readback_enabled=True)
+    adapter._client.get_event = AsyncMock(
+        return_value=_make_text_event(body="**bold** and [link](https://x)")
+    )
+
+    # Use the real _strip_markdown_for_tts behavior to assert end-to-end.
+    fake_tts_result = {"file_path": "/tmp/test.ogg", "duration_ms": 1234}
+    with patch(
+        "gateway.platforms.matrix.text_to_speech_tool",
+        return_value=fake_tts_result,
+    ) as tts_mock, patch("os.unlink"):
+        await adapter._handle_readback_reaction(
+            "!room:example.org", "$parent_msg", "@alice:example.org"
+        )
+    tts_text = tts_mock.call_args.kwargs["text"]
+    assert "**" not in tts_text
+    assert "](" not in tts_text   # markdown link syntax gone
+    assert "bold" in tts_text
+    assert "link" in tts_text
