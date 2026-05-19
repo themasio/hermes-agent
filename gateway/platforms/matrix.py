@@ -123,6 +123,10 @@ class _MatrixApprovalPrompt:
 # but clients render poorly above this).
 MAX_MESSAGE_LENGTH = 4000
 
+# TTS readback (🔊 reaction → voice reply). See matrix-hive
+# docs/superpowers/specs/2026-05-18-tts-readback-design.md.
+READBACK_TRIGGER_EMOJI = "🔊"
+
 # Store directory for E2EE keys and sync state.
 # Uses get_hermes_home() so each profile gets its own Matrix store.
 from hermes_constants import get_hermes_dir as _get_hermes_dir
@@ -455,6 +459,25 @@ class MatrixAdapter(BasePlatformAdapter):
         self._allowed_user_ids: Set[str] = {
             u.strip() for u in allowed_users_raw.split(",") if u.strip()
         }
+
+        # ----- TTS readback (🔊 reaction → voice reply) ------------------
+        # All keys live under PlatformConfig.extra (config.yaml:
+        #   gateway.platforms.matrix.readback_on_reaction: true).
+        # Defaults preserve existing behavior (feature OFF).
+        self._readback_enabled: bool = bool(
+            config.extra.get("readback_on_reaction", False)
+        )
+        self._readback_emoji: str = str(
+            config.extra.get("readback_trigger_emoji", READBACK_TRIGGER_EMOJI)
+        )
+        self._readback_max_chars: int = int(
+            config.extra.get("readback_max_chars", 2000)
+        )
+        self._readback_timeout_secs: int = int(
+            config.extra.get("readback_timeout_seconds", 30)
+        )
+        # Concurrent-lock: parent_event_id while readback is in flight.
+        self._readback_in_flight: set[str] = set()
 
     def _is_duplicate_event(self, event_id) -> bool:
         """Return True if this event was already processed. Tracks the ID otherwise."""

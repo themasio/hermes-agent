@@ -88,3 +88,29 @@ def test_scaffold_can_make_adapter():
     adapter = _make_adapter()
     assert adapter._readback_enabled is True
     assert adapter._readback_emoji == "🔊"
+
+
+def test_ctor_reads_readback_flag_true():
+    adapter = _make_adapter(readback_enabled=True)
+    assert adapter._readback_enabled is True
+    assert adapter._readback_emoji == "🔊"
+    assert adapter._readback_max_chars == 2000
+    assert adapter._readback_timeout_secs == 30
+    assert adapter._readback_in_flight == set()
+
+
+def test_ctor_readback_flag_defaults_false_when_missing():
+    from gateway.platforms.matrix import MatrixAdapter
+    from gateway.config import PlatformConfig
+    config = PlatformConfig(
+        enabled=True,
+        token="***",
+        extra={
+            "homeserver": "https://matrix.example.org",
+            "user_id": "@bot:example.org",
+        },
+    )
+    adapter = MatrixAdapter(config)
+    assert adapter._readback_enabled is False
+    assert adapter._readback_emoji == "🔊"
+    assert adapter._readback_in_flight == set()
