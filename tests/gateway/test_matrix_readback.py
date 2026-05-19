@@ -463,3 +463,24 @@ async def test_error_send_voice_upload_403():
         "!room:example.org", "$parent_msg", "⚠️"
     )
     adapter.send_message.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_success_emits_observability_log(caplog):
+    """Successful readback emits one INFO log line with metrics."""
+    import logging as _logging
+    caplog.set_level(_logging.INFO, logger="gateway.platforms.matrix")
+    adapter = _make_adapter(readback_enabled=True)
+    adapter._client.get_event = AsyncMock(
+        return_value=_make_text_event(body="hello world")
+    )
+    with patch(
+        "gateway.platforms.matrix.text_to_speech_tool",
+        return_value={"file_path": "/tmp/test.ogg", "duration_ms": 4521},
+    ), patch("os.unlink"), patch("os.path.getsize", return_value=1234):
+        await adapter._handle_readback_reaction(
+            "!room:example.org", "$parent_msg", "@alice:example.org"
+        )
+    matching = [r for r in caplog.records if "matrix.readback" in r.getMessage()
+                and "status=ok" in r.getMessage()]
+    assert matching, f"expected success log, got: {[r.getMessage() for r in caplog.records]}"

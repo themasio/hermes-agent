@@ -895,6 +895,13 @@ class MatrixAdapter(BasePlatformAdapter):
 
         client.add_event_handler(EventType.ROOM_MESSAGE, self._on_room_message)
         client.add_event_handler(EventType.REACTION, self._on_reaction)
+        if self._readback_enabled:
+            logger.info(
+                "matrix.readback: registered (emoji=%s, max=%dch, timeout=%ds)",
+                self._readback_emoji,
+                self._readback_max_chars,
+                self._readback_timeout_secs,
+            )
         client.add_event_handler(IntEvt.INVITE, self._on_invite)
 
         # Initial sync to catch up, then start background sync.
@@ -2214,6 +2221,9 @@ class MatrixAdapter(BasePlatformAdapter):
             )
             return
 
+        import time
+        t_start = time.monotonic()
+
         ack_event_id = await self._send_reaction(
             room_id, parent_event_id, "👂"
         )
@@ -2326,6 +2336,16 @@ class MatrixAdapter(BasePlatformAdapter):
                     reason="upload failed",
                 )
                 return
+
+            elapsed_ms = int((time.monotonic() - t_start) * 1000)
+            logger.info(
+                "matrix.readback: room=%s parent=%s sender=%s "
+                "chars=%d audio_ms=%s elapsed_ms=%d status=ok",
+                room_id, parent_event_id, sender,
+                len(text),
+                result.get("duration_ms", "?"),
+                elapsed_ms,
+            )
         finally:
             self._readback_in_flight.discard(parent_event_id)
             if audio_path:
