@@ -2111,6 +2111,59 @@ class MatrixAdapter(BasePlatformAdapter):
             logger.debug("Matrix: reaction send error: %s", exc)
             return None
 
+    def _extract_readback_text(self, evt: Any) -> tuple[Optional[str], Optional[str]]:
+        """Return (text_to_speak, skip_reason).
+
+        - text_to_speak is None when the parent should NOT be read aloud.
+        - skip_reason: None when text_to_speak is set; "silent" for audio/
+          redacted/E2EE cases (no ⚠️ to user); a short reason string
+          otherwise (shown as ⚠️ text reply by caller).
+        """
+        import re as _re
+
+        content = evt.content if hasattr(evt, "content") else None
+        if content is None:
+            return None, "silent"  # E2EE / redacted
+
+        # mautrix exposes content as dict or as a typed object — normalise.
+        def _get(name: str, default=""):
+            if isinstance(content, dict):
+                return content.get(name, default)
+            return getattr(content, name, default)
+
+        msgtype = str(_get("msgtype", ""))
+        body = str(_get("body", "") or "")
+        formatted_body = str(_get("formatted_body", "") or "")
+
+        if msgtype == "m.audio":
+            return None, "silent"
+        if msgtype in {"m.image", "m.file", "m.video"}:
+            # Heuristic: body is a caption only if it doesn't look like a
+            # plain filename. Reuse existing helper if present.
+            if not body.strip():
+                return None, "no text to read"
+            if _looks_like_matrix_image_filename(body):
+                return None, "no text to read"
+            text = body
+        elif msgtype in {"m.text", "m.notice", "m.emote"}:
+            if formatted_body:
+                # Strip HTML tags + collapse whitespace; cheap regex is
+                # enough for our purposes.
+                text = _re.sub(r"<[^>]+>", " ", formatted_body)
+                text = _re.sub(r"\s+", " ", text).strip()
+            else:
+                text = body
+        else:
+            # Unknown msgtype — try body as fallback.
+            if not body.strip():
+                return None, "silent"
+            text = body
+
+        text = _strip_markdown_for_tts(text).strip()
+        if not text:
+            return None, "empty after stripping"
+        return text, None
+
     async def _handle_readback_reaction(
         self,
         room_id: str,
@@ -2138,11 +2191,14 @@ class MatrixAdapter(BasePlatformAdapter):
             # 6c. Fetch the parent event.
             evt = await self._client.get_event(room_id, parent_event_id)
 
-            # 6d. Extract body (full msgtype routing in Task 5; happy path
-            # assumes m.text with plain body).
-            text = evt.content.get("body", "") if isinstance(evt.content, dict) \
-                else getattr(evt.content, "body", "")
-            text = _strip_markdown_for_tts(text)
+            # 6d. Extract body via msgtype-aware helper.
+            text, skip_reason = self._extract_readback_text(evt)
+            if text is None:
+                # Silent vs user-visible handled by caller policy in Task 9.
+                # For now, just redact ack and return.
+                if ack_event_id:
+                    await self._redact_reaction(room_id, ack_event_id)
+                return
 
             # 6e. TTS into a temp ogg file.
             with tempfile.NamedTemporaryFile(

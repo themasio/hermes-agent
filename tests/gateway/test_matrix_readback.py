@@ -227,3 +227,86 @@ async def test_dispatch_invokes_handler_on_speaker_emoji():
     adapter._handle_readback_reaction.assert_awaited_once_with(
         "!room:example.org", "$parent_msg", "@alice:example.org"
     )
+
+
+@pytest.mark.asyncio
+async def test_extract_image_with_caption_reads_caption():
+    """Case 12: m.image with a caption-shaped body → TTS reads it."""
+    adapter = _make_adapter(readback_enabled=True)
+    adapter._client.get_event = AsyncMock(
+        return_value=_make_text_event(
+            body="A photo of the hive in spring",
+            msgtype="m.image",
+        )
+    )
+    fake_tts_result = {"file_path": "/tmp/test.ogg", "duration_ms": 1234}
+    with patch(
+        "gateway.platforms.matrix.text_to_speech_tool",
+        return_value=fake_tts_result,
+    ) as tts_mock, patch("os.unlink"):
+        await adapter._handle_readback_reaction(
+            "!room:example.org", "$parent_msg", "@alice:example.org"
+        )
+    tts_mock.assert_called_once()
+    assert tts_mock.call_args.kwargs["text"] == "A photo of the hive in spring"
+
+
+@pytest.mark.asyncio
+async def test_extract_image_filename_only_skipped():
+    """Case 13: m.image body == filename → skip TTS (no caption-shaped text)."""
+    adapter = _make_adapter(readback_enabled=True)
+    adapter._client.get_event = AsyncMock(
+        return_value=_make_text_event(
+            body="IMG_1234.jpg",
+            msgtype="m.image",
+        )
+    )
+    with patch("gateway.platforms.matrix.text_to_speech_tool") as tts_mock:
+        await adapter._handle_readback_reaction(
+            "!room:example.org", "$parent_msg", "@alice:example.org"
+        )
+    tts_mock.assert_not_called()
+    adapter.send_voice.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_extract_audio_parent_skipped_silently():
+    """Case 14: parent is m.audio → silent skip, no ⚠️."""
+    adapter = _make_adapter(readback_enabled=True)
+    adapter._client.get_event = AsyncMock(
+        return_value=_make_text_event(body="voice.ogg", msgtype="m.audio")
+    )
+    with patch("gateway.platforms.matrix.text_to_speech_tool") as tts_mock:
+        await adapter._handle_readback_reaction(
+            "!room:example.org", "$parent_msg", "@alice:example.org"
+        )
+    tts_mock.assert_not_called()
+    adapter.send_voice.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_extract_html_formatted_body_strips_tags():
+    """formatted_body present → HTML stripped before markdown strip."""
+    adapter = _make_adapter(readback_enabled=True)
+    adapter._client.get_event = AsyncMock(
+        return_value=_make_text_event(
+            body="raw body",
+            msgtype="m.text",
+            formatted_body="<b>raw body</b> <a href='x'>link</a>",
+        )
+    )
+    fake_tts_result = {"file_path": "/tmp/test.ogg", "duration_ms": 1234}
+    with patch(
+        "gateway.platforms.matrix.text_to_speech_tool",
+        return_value=fake_tts_result,
+    ) as tts_mock, patch(
+        "gateway.platforms.matrix._strip_markdown_for_tts",
+        side_effect=lambda t: t,
+    ), patch("os.unlink"):
+        await adapter._handle_readback_reaction(
+            "!room:example.org", "$parent_msg", "@alice:example.org"
+        )
+    tts_mock.assert_called_once()
+    text = tts_mock.call_args.kwargs["text"]
+    assert "<b>" not in text and "</b>" not in text
+    assert "raw body link" in text or "raw body" in text
