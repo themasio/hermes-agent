@@ -104,6 +104,7 @@ from gateway.platforms.base import (
     proxy_kwargs_for_aiohttp,
 )
 from gateway.platforms.helpers import ThreadParticipationTracker
+from tools.tts_tool import text_to_speech_tool, _strip_markdown_for_tts
 
 logger = logging.getLogger(__name__)
 
@@ -2109,6 +2110,62 @@ class MatrixAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.debug("Matrix: reaction send error: %s", exc)
             return None
+
+    async def _handle_readback_reaction(
+        self,
+        room_id: str,
+        parent_event_id: str,
+        sender: str,
+    ) -> None:
+        """Fetch parent event, TTS its body, post as voice reply.
+
+        See matrix-hive docs/superpowers/specs/2026-05-18-tts-readback-design.md.
+
+        Happy path only at this stage; failure paths added in later tasks.
+        """
+        import os
+        import tempfile
+
+        # 6a. Ack 👂 on the parent so user sees us working.
+        ack_event_id = await self._send_reaction(
+            room_id, parent_event_id, "👂"
+        )
+
+        # 6b. In-flight lock (concurrent guard expanded in Task 8).
+        self._readback_in_flight.add(parent_event_id)
+        audio_path = None
+        try:
+            # 6c. Fetch the parent event.
+            evt = await self._client.get_event(room_id, parent_event_id)
+
+            # 6d. Extract body (full msgtype routing in Task 5; happy path
+            # assumes m.text with plain body).
+            text = evt.content.get("body", "") if isinstance(evt.content, dict) \
+                else getattr(evt.content, "body", "")
+            text = _strip_markdown_for_tts(text)
+
+            # 6e. TTS into a temp ogg file.
+            with tempfile.NamedTemporaryFile(
+                suffix=".ogg", delete=False
+            ) as tmp:
+                output_path = tmp.name
+            result = text_to_speech_tool(text=text, output_path=output_path)
+            audio_path = result.get("file_path", output_path)
+
+            # 6f. Send as voice reply.
+            await self.send_voice(
+                chat_id=room_id,
+                audio_path=audio_path,
+                reply_to=parent_event_id,
+            )
+        finally:
+            # 6g. Cleanup.
+            self._readback_in_flight.discard(parent_event_id)
+            if audio_path:
+                try:
+                    os.unlink(audio_path)
+                except OSError:
+                    pass
 
     async def _redact_reaction(
         self,

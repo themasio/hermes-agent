@@ -114,3 +114,43 @@ def test_ctor_readback_flag_defaults_false_when_missing():
     assert adapter._readback_enabled is False
     assert adapter._readback_emoji == "🔊"
     assert adapter._readback_in_flight == set()
+
+
+@pytest.mark.asyncio
+async def test_readback_happy_path_text():
+    """Case 1 (spec §10.1): reacting 🔊 on m.text → TTS → voice reply."""
+    adapter = _make_adapter(readback_enabled=True)
+    adapter._client.get_event = AsyncMock(
+        return_value=_make_text_event(body="hello world")
+    )
+
+    fake_tts_result = {"file_path": "/tmp/test.ogg", "duration_ms": 1234}
+    with patch(
+        "gateway.platforms.matrix.text_to_speech_tool",
+        return_value=fake_tts_result,
+    ) as tts_mock, patch(
+        "gateway.platforms.matrix._strip_markdown_for_tts",
+        side_effect=lambda t: t,
+    ), patch("os.unlink"):
+        await adapter._handle_readback_reaction(
+            room_id="!room:example.org",
+            parent_event_id="$parent_msg",
+            sender="@alice:example.org",
+        )
+
+    # Ack 👂 was sent on parent
+    adapter._send_reaction.assert_any_await(
+        "!room:example.org", "$parent_msg", "👂"
+    )
+    # TTS was invoked with the text body
+    tts_mock.assert_called_once()
+    _, tts_kwargs = tts_mock.call_args
+    assert tts_kwargs["text"] == "hello world"
+    # Voice was sent as a reply to the parent
+    adapter.send_voice.assert_awaited_once()
+    _, voice_kwargs = adapter.send_voice.call_args
+    assert voice_kwargs["audio_path"] == "/tmp/test.ogg"
+    assert voice_kwargs["reply_to"] == "$parent_msg"
+    assert voice_kwargs["chat_id"] == "!room:example.org"
+    # In-flight set is cleared after completion
+    assert "$parent_msg" not in adapter._readback_in_flight
