@@ -28,6 +28,7 @@ Environment variables:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import mimetypes
 import os
@@ -104,6 +105,7 @@ from gateway.platforms.base import (
     proxy_kwargs_for_aiohttp,
 )
 from gateway.platforms.helpers import ThreadParticipationTracker
+from tools.tts_tool import text_to_speech_tool, _strip_markdown_for_tts
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +124,10 @@ class _MatrixApprovalPrompt:
 # Matrix message size limit (4000 chars practical, spec has no hard limit
 # but clients render poorly above this).
 MAX_MESSAGE_LENGTH = 4000
+
+# TTS readback (🔊 reaction → voice reply). See matrix-hive
+# docs/superpowers/specs/2026-05-18-tts-readback-design.md.
+READBACK_TRIGGER_EMOJI = "🔊"
 
 # Store directory for E2EE keys and sync state.
 # Uses get_hermes_home() so each profile gets its own Matrix store.
@@ -455,6 +461,25 @@ class MatrixAdapter(BasePlatformAdapter):
         self._allowed_user_ids: Set[str] = {
             u.strip() for u in allowed_users_raw.split(",") if u.strip()
         }
+
+        # ----- TTS readback (🔊 reaction → voice reply) ------------------
+        # All keys live under PlatformConfig.extra (config.yaml:
+        #   gateway.platforms.matrix.readback_on_reaction: true).
+        # Defaults preserve existing behavior (feature OFF).
+        self._readback_enabled: bool = bool(
+            config.extra.get("readback_on_reaction", False)
+        )
+        self._readback_emoji: str = str(
+            config.extra.get("readback_trigger_emoji", READBACK_TRIGGER_EMOJI)
+        )
+        self._readback_max_chars: int = int(
+            config.extra.get("readback_max_chars", 2000)
+        )
+        self._readback_timeout_secs: int = int(
+            config.extra.get("readback_timeout_seconds", 30)
+        )
+        # Concurrent-lock: parent_event_id while readback is in flight.
+        self._readback_in_flight: set[str] = set()
 
     def _is_duplicate_event(self, event_id) -> bool:
         """Return True if this event was already processed. Tracks the ID otherwise."""
@@ -871,6 +896,13 @@ class MatrixAdapter(BasePlatformAdapter):
 
         client.add_event_handler(EventType.ROOM_MESSAGE, self._on_room_message)
         client.add_event_handler(EventType.REACTION, self._on_reaction)
+        if self._readback_enabled:
+            logger.info(
+                "matrix.readback: registered (emoji=%s, max=%dch, timeout=%ds)",
+                self._readback_emoji,
+                self._readback_max_chars,
+                self._readback_timeout_secs,
+            )
         client.add_event_handler(IntEvt.INVITE, self._on_invite)
 
         # Initial sync to catch up, then start background sync.
@@ -2087,6 +2119,294 @@ class MatrixAdapter(BasePlatformAdapter):
             logger.debug("Matrix: reaction send error: %s", exc)
             return None
 
+    @staticmethod
+    def _event_relates_to(evt: Any) -> dict:
+        """Return an event's m.relates_to as a plain dict ({} if absent).
+
+        mautrix exposes content as a dict or a typed object — normalise both
+        (serialize() the typed case so rel_type comes back as the wire string
+        "m.thread", not a RelationType enum).
+        """
+        content = getattr(evt, "content", None)
+        if content is None:
+            return {}
+        raw = content
+        if not isinstance(raw, dict):
+            serialize = getattr(content, "serialize", None)
+            if not callable(serialize):
+                return {}
+            try:
+                raw = serialize() or {}
+            except Exception:
+                return {}
+        rel = raw.get("m.relates_to") if isinstance(raw, dict) else None
+        return rel if isinstance(rel, dict) else {}
+
+    def _extract_readback_text(self, evt: Any) -> tuple[Optional[str], Optional[str]]:
+        """Return (text_to_speak, skip_reason).
+
+        - text_to_speak is None when the parent should NOT be read aloud.
+        - skip_reason: None when text_to_speak is set; "silent" for audio/
+          redacted/E2EE cases (no ⚠️ to user); a short reason string
+          otherwise (shown as ⚠️ text reply by caller).
+        """
+        import re as _re
+
+        content = evt.content if hasattr(evt, "content") else None
+        if content is None:
+            return None, "silent"  # E2EE / redacted
+
+        # mautrix exposes content as dict or as a typed object — normalise.
+        def _get(name: str, default=""):
+            if isinstance(content, dict):
+                return content.get(name, default)
+            return getattr(content, name, default)
+
+        msgtype = str(_get("msgtype", ""))
+        body = str(_get("body", "") or "")
+        formatted_body = str(_get("formatted_body", "") or "")
+
+        if msgtype == "m.audio":
+            return None, "silent"
+        if msgtype in {"m.image", "m.file", "m.video"}:
+            # Heuristic: body is a caption only if it doesn't look like a
+            # plain filename. Reuse existing helper if present.
+            if not body.strip():
+                return None, "no text to read"
+            if _looks_like_matrix_image_filename(body):
+                return None, "no text to read"
+            text = body
+        elif msgtype in {"m.text", "m.notice", "m.emote"}:
+            if formatted_body:
+                # Strip HTML tags + collapse whitespace; cheap regex is
+                # enough for our purposes.
+                text = _re.sub(r"<[^>]+>", " ", formatted_body)
+                text = _re.sub(r"\s+", " ", text).strip()
+            else:
+                text = body
+        else:
+            # Unknown msgtype — try body as fallback.
+            if not body.strip():
+                return None, "silent"
+            text = body
+
+        text = _strip_markdown_for_tts(text).strip()
+        if not text:
+            return None, "empty after stripping"
+        return text, None
+
+    async def _post_readback_error(
+        self,
+        room_id: str,
+        parent_event_id: str,
+        ack_event_id: Optional[str],
+        reason: str,
+        *,
+        silent: bool = False,
+    ) -> None:
+        """Common error tail: redact 👂 ack; if not silent, add ⚠️ + text reply."""
+        if ack_event_id:
+            try:
+                await self._redact_reaction(room_id, ack_event_id)
+            except Exception:
+                logger.debug("matrix.readback: redact-ack failed", exc_info=True)
+        if silent:
+            return
+        try:
+            await self._send_reaction(room_id, parent_event_id, "⚠️")
+        except Exception:
+            logger.debug("matrix.readback: warn-react failed", exc_info=True)
+        try:
+            await self.send_message(
+                room_id,
+                f"⚠️ readback failed: {reason}",
+                reply_to=parent_event_id,
+            )
+        except Exception:
+            logger.debug("matrix.readback: warn-text-reply failed", exc_info=True)
+
+    async def _handle_readback_reaction(
+        self,
+        room_id: str,
+        parent_event_id: str,
+        sender: str,
+    ) -> None:
+        """Fetch parent event, TTS its body, post as voice reply.
+
+        Spec: matrix-hive docs/superpowers/specs/2026-05-18-tts-readback-design.md
+        """
+        import os
+        import tempfile
+
+        if parent_event_id in self._readback_in_flight:
+            logger.debug(
+                "matrix.readback: skip in-flight parent=%s sender=%s",
+                parent_event_id, sender,
+            )
+            return
+
+        import time
+        t_start = time.monotonic()
+
+        ack_event_id = await self._send_reaction(
+            room_id, parent_event_id, "👂"
+        )
+        self._readback_in_flight.add(parent_event_id)
+        audio_path = None
+        try:
+            # 6c. Fetch parent event.
+            try:
+                evt = await self._client.get_event(room_id, parent_event_id)
+            except Exception as exc:
+                logger.warning(
+                    "matrix.readback: get_event failed parent=%s: %s",
+                    parent_event_id, exc,
+                )
+                await self._post_readback_error(
+                    room_id, parent_event_id, ack_event_id,
+                    reason="parent unavailable", silent=True,
+                )
+                return
+
+            # 6d. Extract.
+            text, skip_reason = self._extract_readback_text(evt)
+            if text is None:
+                await self._post_readback_error(
+                    room_id, parent_event_id, ack_event_id,
+                    reason=skip_reason or "no text",
+                    silent=(skip_reason == "silent"),
+                )
+                return
+
+            # Truncate at sentence boundary if too long.
+            if len(text) > self._readback_max_chars:
+                original_len = len(text)
+                cap = self._readback_max_chars - 40
+                cut = text[:cap]
+                last_end = max(
+                    cut.rfind(". "), cut.rfind("? "), cut.rfind("! ")
+                )
+                if last_end > cap * 0.5:
+                    cut = cut[: last_end + 1]
+                text = f"{cut.rstrip()} … [truncated, {original_len} chars]"
+                await self._send_reaction(room_id, parent_event_id, "📏")
+
+            # 6e. TTS with timeout.
+            with tempfile.NamedTemporaryFile(
+                suffix=".ogg", delete=False
+            ) as tmp:
+                output_path = tmp.name
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        text_to_speech_tool,
+                        text=text,
+                        output_path=output_path,
+                    ),
+                    timeout=self._readback_timeout_secs,
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    "matrix.readback: TTS timeout parent=%s after %ds",
+                    parent_event_id, self._readback_timeout_secs,
+                )
+                await self._post_readback_error(
+                    room_id, parent_event_id, ack_event_id,
+                    reason="TTS timeout",
+                )
+                return
+            except Exception as exc:
+                logger.error(
+                    "matrix.readback: TTS error parent=%s: %s",
+                    parent_event_id, exc,
+                )
+                await self._post_readback_error(
+                    room_id, parent_event_id, ack_event_id,
+                    reason=f"TTS error: {exc}",
+                )
+                return
+
+            # text_to_speech_tool returns a JSON *string* (not a dict).
+            # Accept a dict too so unit tests that mock a dict still pass.
+            if isinstance(result, dict):
+                tts_result = result
+            else:
+                try:
+                    tts_result = json.loads(result) if result else {}
+                except (json.JSONDecodeError, TypeError):
+                    tts_result = {}
+            if not isinstance(tts_result, dict):
+                tts_result = {}
+            if tts_result.get("success") is False:
+                await self._post_readback_error(
+                    room_id, parent_event_id, ack_event_id,
+                    reason=f"TTS error: {tts_result.get('error', 'unknown')}",
+                )
+                return
+
+            audio_path = tts_result.get("file_path") or output_path
+
+            # Empty-audio guard.
+            try:
+                if not audio_path or os.path.getsize(audio_path) == 0:
+                    await self._post_readback_error(
+                        room_id, parent_event_id, ack_event_id,
+                        reason="TTS produced empty audio",
+                    )
+                    return
+            except OSError:
+                await self._post_readback_error(
+                    room_id, parent_event_id, ack_event_id,
+                    reason="TTS produced empty audio",
+                )
+                return
+
+            # 6f. Send as voice reply.
+            # Co-locate the voice with the message being read: if the parent
+            # lives in a thread, reply *into that same thread* so the voice
+            # bubble appears beside the source. Without this the voice posts
+            # to the main timeline and is invisible from the thread view.
+            voice_metadata = None
+            parent_rel = self._event_relates_to(evt)
+            if parent_rel.get("rel_type") == "m.thread":
+                thread_root = parent_rel.get("event_id")
+                if thread_root:
+                    voice_metadata = {"thread_id": thread_root}
+            try:
+                await self.send_voice(
+                    chat_id=room_id,
+                    audio_path=audio_path,
+                    reply_to=parent_event_id,
+                    metadata=voice_metadata,
+                )
+            except Exception as exc:
+                logger.error(
+                    "matrix.readback: send_voice failed parent=%s: %s",
+                    parent_event_id, exc,
+                )
+                await self._post_readback_error(
+                    room_id, parent_event_id, ack_event_id,
+                    reason="upload failed",
+                )
+                return
+
+            elapsed_ms = int((time.monotonic() - t_start) * 1000)
+            logger.info(
+                "matrix.readback: room=%s parent=%s sender=%s "
+                "chars=%d audio_ms=%s elapsed_ms=%d status=ok",
+                room_id, parent_event_id, sender,
+                len(text),
+                tts_result.get("duration_ms", "?"),
+                elapsed_ms,
+            )
+        finally:
+            self._readback_in_flight.discard(parent_event_id)
+            if audio_path:
+                try:
+                    os.unlink(audio_path)
+                except OSError:
+                    pass
+
     async def _redact_reaction(
         self,
         room_id: str,
@@ -2196,6 +2516,21 @@ class MatrixAdapter(BasePlatformAdapter):
                 reacts_to,
                 room_id,
             )
+
+            # ----- TTS readback dispatch (🔊 → voice reply) ---------------
+            # Spec: matrix-hive docs/superpowers/specs/2026-05-18-tts-readback-design.md §5.2
+            if self._readback_enabled and key == self._readback_emoji:
+                # Don't collide with approval-prompt flow (covered below).
+                approval = self._approval_prompts_by_event.get(reacts_to)
+                if approval is None or approval.resolved:
+                    import asyncio as _asyncio
+                    _asyncio.create_task(
+                        self._handle_readback_reaction(
+                            room_id, reacts_to, sender
+                        )
+                    )
+                    return
+            # -----------------------------------------------------------------
 
             # Check if this reaction resolves a pending approval prompt.
             prompt = self._approval_prompts_by_event.get(reacts_to)
