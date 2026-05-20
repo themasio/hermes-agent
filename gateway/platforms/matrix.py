@@ -2362,16 +2362,18 @@ class MatrixAdapter(BasePlatformAdapter):
                 return
 
             # 6f. Send as voice reply.
-            # Co-locate the voice with the message being read: if the parent
-            # lives in a thread, reply *into that same thread* so the voice
-            # bubble appears beside the source. Without this the voice posts
-            # to the main timeline and is invisible from the thread view.
-            voice_metadata = None
+            # Always deliver the voice INTO a thread so it's never an orphan
+            # bubble in the main timeline. If the parent already lives in a
+            # thread, reuse that root; otherwise root a new thread on the
+            # parent itself (the message that was 🔊-reacted). This makes
+            # readback thread-consistent regardless of whether the source
+            # bot threaded its reply.
             parent_rel = self._event_relates_to(evt)
-            if parent_rel.get("rel_type") == "m.thread":
-                thread_root = parent_rel.get("event_id")
-                if thread_root:
-                    voice_metadata = {"thread_id": thread_root}
+            if parent_rel.get("rel_type") == "m.thread" and parent_rel.get("event_id"):
+                thread_root = parent_rel["event_id"]
+            else:
+                thread_root = parent_event_id
+            voice_metadata = {"thread_id": thread_root}
             try:
                 await self.send_voice(
                     chat_id=room_id,

@@ -196,8 +196,12 @@ async def test_readback_threaded_parent_inherits_thread():
 
 
 @pytest.mark.asyncio
-async def test_readback_main_timeline_parent_no_thread():
-    """🔊 on a top-level message → plain reply, no thread relation."""
+async def test_readback_main_timeline_parent_roots_new_thread():
+    """L1: 🔊 on a top-level message → readback roots a NEW thread on it.
+
+    The voice is always threaded; a main-timeline parent becomes the thread
+    root so the voice never lands as an orphan main-timeline bubble.
+    """
     adapter = _make_adapter(readback_enabled=True)
     adapter._client.get_event = AsyncMock(
         return_value=_make_text_event(body="readback test one")
@@ -219,7 +223,8 @@ async def test_readback_main_timeline_parent_no_thread():
 
     adapter.send_voice.assert_awaited_once()
     _, voice_kwargs = adapter.send_voice.call_args
-    assert voice_kwargs.get("metadata") is None
+    assert voice_kwargs["reply_to"] == "$parent_msg"
+    assert voice_kwargs["metadata"] == {"thread_id": "$parent_msg"}
 
 
 @pytest.mark.asyncio
