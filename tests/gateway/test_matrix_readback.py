@@ -484,3 +484,58 @@ async def test_success_emits_observability_log(caplog):
     matching = [r for r in caplog.records if "matrix.readback" in r.getMessage()
                 and "status=ok" in r.getMessage()]
     assert matching, f"expected success log, got: {[r.getMessage() for r in caplog.records]}"
+
+
+@pytest.mark.asyncio
+async def test_tts_result_json_string_is_parsed():
+    """Regression: text_to_speech_tool returns a JSON *string*, not a dict.
+
+    The real tool returns json.dumps({...}); the handler must parse it before
+    reading file_path. Mocking a dict (other tests) hid this — exercise the
+    string shape explicitly.
+    """
+    import json as _json
+    adapter = _make_adapter(readback_enabled=True)
+    adapter._client.get_event = AsyncMock(
+        return_value=_make_text_event(body="hello world")
+    )
+    tts_json = _json.dumps({
+        "success": True,
+        "file_path": "/tmp/test.ogg",
+        "media_tag": "MEDIA:/tmp/test.ogg",
+        "provider": "edge",
+        "voice_compatible": False,
+    })
+    with patch(
+        "gateway.platforms.matrix.text_to_speech_tool",
+        return_value=tts_json,
+    ), patch("os.unlink"), patch("os.path.getsize", return_value=1234):
+        await adapter._handle_readback_reaction(
+            "!room:example.org", "$parent_msg", "@alice:example.org"
+        )
+    adapter.send_voice.assert_awaited_once()
+    _, voice_kwargs = adapter.send_voice.call_args
+    assert voice_kwargs["audio_path"] == "/tmp/test.ogg"
+    assert voice_kwargs["reply_to"] == "$parent_msg"
+
+
+@pytest.mark.asyncio
+async def test_tts_result_json_failure_surfaces_warning():
+    """Regression: TTS JSON with success=false → ⚠️ error, no send_voice."""
+    import json as _json
+    adapter = _make_adapter(readback_enabled=True)
+    adapter._client.get_event = AsyncMock(
+        return_value=_make_text_event(body="hello world")
+    )
+    tts_json = _json.dumps({"success": False, "error": "no API key"})
+    with patch(
+        "gateway.platforms.matrix.text_to_speech_tool",
+        return_value=tts_json,
+    ), patch("os.unlink"), patch("os.path.getsize", return_value=1234):
+        await adapter._handle_readback_reaction(
+            "!room:example.org", "$parent_msg", "@alice:example.org"
+        )
+    adapter.send_voice.assert_not_awaited()
+    adapter._send_reaction.assert_any_await(
+        "!room:example.org", "$parent_msg", "⚠️"
+    )

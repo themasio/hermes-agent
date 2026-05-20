@@ -28,6 +28,7 @@ Environment variables:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import mimetypes
 import os
@@ -2302,7 +2303,25 @@ class MatrixAdapter(BasePlatformAdapter):
                 )
                 return
 
-            audio_path = result.get("file_path", output_path)
+            # text_to_speech_tool returns a JSON *string* (not a dict).
+            # Accept a dict too so unit tests that mock a dict still pass.
+            if isinstance(result, dict):
+                tts_result = result
+            else:
+                try:
+                    tts_result = json.loads(result) if result else {}
+                except (json.JSONDecodeError, TypeError):
+                    tts_result = {}
+            if not isinstance(tts_result, dict):
+                tts_result = {}
+            if tts_result.get("success") is False:
+                await self._post_readback_error(
+                    room_id, parent_event_id, ack_event_id,
+                    reason=f"TTS error: {tts_result.get('error', 'unknown')}",
+                )
+                return
+
+            audio_path = tts_result.get("file_path") or output_path
 
             # Empty-audio guard.
             try:
@@ -2343,7 +2362,7 @@ class MatrixAdapter(BasePlatformAdapter):
                 "chars=%d audio_ms=%s elapsed_ms=%d status=ok",
                 room_id, parent_event_id, sender,
                 len(text),
-                result.get("duration_ms", "?"),
+                tts_result.get("duration_ms", "?"),
                 elapsed_ms,
             )
         finally:
