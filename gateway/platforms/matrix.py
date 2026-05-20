@@ -2119,6 +2119,29 @@ class MatrixAdapter(BasePlatformAdapter):
             logger.debug("Matrix: reaction send error: %s", exc)
             return None
 
+    @staticmethod
+    def _event_relates_to(evt: Any) -> dict:
+        """Return an event's m.relates_to as a plain dict ({} if absent).
+
+        mautrix exposes content as a dict or a typed object — normalise both
+        (serialize() the typed case so rel_type comes back as the wire string
+        "m.thread", not a RelationType enum).
+        """
+        content = getattr(evt, "content", None)
+        if content is None:
+            return {}
+        raw = content
+        if not isinstance(raw, dict):
+            serialize = getattr(content, "serialize", None)
+            if not callable(serialize):
+                return {}
+            try:
+                raw = serialize() or {}
+            except Exception:
+                return {}
+        rel = raw.get("m.relates_to") if isinstance(raw, dict) else None
+        return rel if isinstance(rel, dict) else {}
+
     def _extract_readback_text(self, evt: Any) -> tuple[Optional[str], Optional[str]]:
         """Return (text_to_speak, skip_reason).
 
@@ -2339,11 +2362,22 @@ class MatrixAdapter(BasePlatformAdapter):
                 return
 
             # 6f. Send as voice reply.
+            # Co-locate the voice with the message being read: if the parent
+            # lives in a thread, reply *into that same thread* so the voice
+            # bubble appears beside the source. Without this the voice posts
+            # to the main timeline and is invisible from the thread view.
+            voice_metadata = None
+            parent_rel = self._event_relates_to(evt)
+            if parent_rel.get("rel_type") == "m.thread":
+                thread_root = parent_rel.get("event_id")
+                if thread_root:
+                    voice_metadata = {"thread_id": thread_root}
             try:
                 await self.send_voice(
                     chat_id=room_id,
                     audio_path=audio_path,
                     reply_to=parent_event_id,
+                    metadata=voice_metadata,
                 )
             except Exception as exc:
                 logger.error(

@@ -157,6 +157,72 @@ async def test_readback_happy_path_text():
 
 
 @pytest.mark.asyncio
+async def test_readback_threaded_parent_inherits_thread():
+    """Fix: 🔊 on a message inside a thread → voice replies INTO that thread.
+
+    Regression: the voice used to post to the main timeline (m.in_reply_to
+    only), invisible from the thread view. It must now carry
+    metadata.thread_id = the parent's thread root.
+    """
+    adapter = _make_adapter(readback_enabled=True)
+    threaded_parent = SimpleNamespace(content={
+        "msgtype": "m.text",
+        "body": "Because light attracts bugs!",
+        "m.relates_to": {
+            "rel_type": "m.thread",
+            "event_id": "$thread_root",
+        },
+    })
+    adapter._client.get_event = AsyncMock(return_value=threaded_parent)
+
+    fake_tts_result = {"file_path": "/tmp/test.ogg", "duration_ms": 1234}
+    with patch(
+        "gateway.platforms.matrix.text_to_speech_tool",
+        return_value=fake_tts_result,
+    ), patch(
+        "gateway.platforms.matrix._strip_markdown_for_tts",
+        side_effect=lambda t: t,
+    ), patch("os.unlink"), patch("os.path.getsize", return_value=1234):
+        await adapter._handle_readback_reaction(
+            room_id="!room:example.org",
+            parent_event_id="$parent_msg",
+            sender="@alice:example.org",
+        )
+
+    adapter.send_voice.assert_awaited_once()
+    _, voice_kwargs = adapter.send_voice.call_args
+    assert voice_kwargs["reply_to"] == "$parent_msg"
+    assert voice_kwargs["metadata"] == {"thread_id": "$thread_root"}
+
+
+@pytest.mark.asyncio
+async def test_readback_main_timeline_parent_no_thread():
+    """🔊 on a top-level message → plain reply, no thread relation."""
+    adapter = _make_adapter(readback_enabled=True)
+    adapter._client.get_event = AsyncMock(
+        return_value=_make_text_event(body="readback test one")
+    )
+
+    fake_tts_result = {"file_path": "/tmp/test.ogg", "duration_ms": 1234}
+    with patch(
+        "gateway.platforms.matrix.text_to_speech_tool",
+        return_value=fake_tts_result,
+    ), patch(
+        "gateway.platforms.matrix._strip_markdown_for_tts",
+        side_effect=lambda t: t,
+    ), patch("os.unlink"), patch("os.path.getsize", return_value=1234):
+        await adapter._handle_readback_reaction(
+            room_id="!room:example.org",
+            parent_event_id="$parent_msg",
+            sender="@alice:example.org",
+        )
+
+    adapter.send_voice.assert_awaited_once()
+    _, voice_kwargs = adapter.send_voice.call_args
+    assert voice_kwargs.get("metadata") is None
+
+
+@pytest.mark.asyncio
 async def test_dispatch_skip_when_flag_disabled():
     """Case 2: flag off → no readback even if 🔊."""
     adapter = _make_adapter(readback_enabled=False)
