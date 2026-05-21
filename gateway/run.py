@@ -6386,6 +6386,55 @@ class GatewayRunner:
 
         return "pair"
 
+    def _get_unauthorized_room_mention_behavior(self, platform: Optional[Platform]) -> str:
+        """How to handle an unlisted sender's @mention in a room/group.
+
+        Sibling of ``_get_unauthorized_dm_behavior`` for the room-mention path.
+        Defaults to ``"ignore"`` (preserve the current silent drop); opt in per
+        platform with ``{PLATFORM}_UNAUTHORIZED_ROOM_MENTION_BEHAVIOR=pair``.
+
+        Room mentions are co-present + intent-gated (an explicit @mention in a
+        shared room), so a pairing offer here does not carry the DM-to-strangers
+        spam / info-leak risk that makes the DM default flip to ignore (#9337).
+        """
+        if platform is not None:
+            env_key = f"{platform.value.upper()}_UNAUTHORIZED_ROOM_MENTION_BEHAVIOR"
+            val = os.getenv(env_key, "").strip().lower()
+            if val in {"pair", "ignore"}:
+                return val
+        return "ignore"
+
+    async def _offer_room_mention_pairing(self, source) -> None:
+        """Post a pairing offer for an unlisted sender's room @mention.
+
+        Mirrors the DM pairing offer (see _handle_message) but targets the
+        room/group the mention arrived in. Rate-limited via the same
+        PairingStore guard so a noisy or hostile sender can't flood the room.
+        """
+        platform_name = source.platform.value if source.platform else "unknown"
+        if self.pairing_store._is_rate_limited(platform_name, source.user_id):
+            return
+        code = self.pairing_store.generate_code(
+            platform_name, source.user_id, source.user_name or ""
+        )
+        adapter = self.adapters.get(source.platform)
+        if not adapter:
+            return
+        if code:
+            await adapter.send(
+                source.chat_id,
+                f"Hi~ I don't recognize {source.user_name or 'you'} yet.\n\n"
+                f"Pairing code: `{code}`\n\n"
+                f"The bot owner can approve with:\n"
+                f"`hermes pairing approve {platform_name} {code}`"
+            )
+        else:
+            await adapter.send(
+                source.chat_id,
+                "Too many pairing requests right now~ Please try again later!"
+            )
+            self.pairing_store._record_rate_limit(platform_name, source.user_id)
+
     async def _deliver_platform_notice(self, source, content: str) -> None:
         """Deliver a setup/operational notice using platform-specific privacy rules."""
         adapter = self.adapters.get(source.platform)
@@ -6522,6 +6571,12 @@ class GatewayRunner:
                         )
                     # Record rate limit so subsequent messages are silently ignored
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
+            elif source.chat_type != "dm" and self._get_unauthorized_room_mention_behavior(source.platform) == "pair":
+                # Room/group: an unlisted sender @mentioned the bot. The adapter's
+                # require_mention gate already ensured this is a real mention, so
+                # offer pairing in-room instead of silently dropping. Opt-in via
+                # {PLATFORM}_UNAUTHORIZED_ROOM_MENTION_BEHAVIOR=pair (default ignore).
+                await self._offer_room_mention_pairing(source)
             return None
         
         # Intercept messages that are responses to a pending /update prompt.
