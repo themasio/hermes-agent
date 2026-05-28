@@ -562,13 +562,12 @@ def load_cli_config() -> Dict[str, Any]:
         "singularity_image": "TERMINAL_SINGULARITY_IMAGE",
         "modal_image": "TERMINAL_MODAL_IMAGE",
         "daytona_image": "TERMINAL_DAYTONA_IMAGE",
-        "vercel_runtime": "TERMINAL_VERCEL_RUNTIME",
         # SSH config
         "ssh_host": "TERMINAL_SSH_HOST",
         "ssh_user": "TERMINAL_SSH_USER",
         "ssh_port": "TERMINAL_SSH_PORT",
         "ssh_key": "TERMINAL_SSH_KEY",
-        # Container resource config (docker, singularity, modal, daytona, vercel_sandbox -- ignored for local/ssh)
+        # Container resource config (docker, singularity, modal, daytona -- ignored for local/ssh)
         "container_cpu": "TERMINAL_CONTAINER_CPU",
         "container_memory": "TERMINAL_CONTAINER_MEMORY",
         "container_disk": "TERMINAL_CONTAINER_DISK",
@@ -7155,11 +7154,13 @@ class HermesCLI:
 
         * ``sys.platform == "win32"`` — native Windows console (ConPTY /
           win32_input) does not support the modal reliably.
-        * Called from a non-main thread — the prompt_toolkit event loop only
-          runs on the main thread; key bindings can't fire from a daemon
-          thread (same rationale as the ``_prompt_text_input`` thread guard
-          in PR #23454).
         * ``self._app`` is not set — unit tests / non-interactive contexts.
+
+        On non-Windows platforms the modal itself is still safe from the
+        ``process_loop`` daemon thread as long as the main-thread event loop
+        owns the prompt_toolkit buffer mutations.  When we are off the main
+        thread, schedule the modal snapshot / restore work on ``self._app.loop``
+        via ``call_soon_threadsafe`` and keep the queue-based response path.
         """
         import threading
         import time as _time
@@ -7180,33 +7181,62 @@ class HermesCLI:
         if sys.platform == "win32":
             return self._prompt_text_input("Choice [1/2/3]: ")
 
-        # Mirror the thread-aware guard from _prompt_text_input (PR #23454):
-        # run_in_terminal and the modal queue both depend on the main-thread
-        # event loop.  From a daemon thread the modal key bindings never fire.
-        if threading.current_thread() is not threading.main_thread():
+        try:
+            app_loop = self._app.loop
+        except Exception:
+            app_loop = None
+
+        in_main_thread = threading.current_thread() is threading.main_thread()
+        if not in_main_thread and app_loop is None:
             return self._prompt_text_input("Choice [1/2/3]: ")
 
         response_queue = queue.Queue()
-        self._capture_modal_input_snapshot()
-        self._slash_confirm_state = {
-            "title": title,
-            "detail": detail,
-            "choices": choices,
-            "selected": 0,
-            "response_queue": response_queue,
-        }
-        self._slash_confirm_deadline = _time.monotonic() + timeout
-        self._invalidate()
+
+        def _setup_modal() -> None:
+            self._capture_modal_input_snapshot()
+            self._slash_confirm_state = {
+                "title": title,
+                "detail": detail,
+                "choices": choices,
+                "selected": 0,
+                "response_queue": response_queue,
+            }
+            self._slash_confirm_deadline = _time.monotonic() + timeout
+            self._invalidate()
+
+        def _teardown_modal() -> None:
+            self._slash_confirm_state = None
+            self._slash_confirm_deadline = 0
+            self._restore_modal_input_snapshot()
+            self._invalidate()
+
+        def _run_on_app_loop(fn) -> bool:
+            if in_main_thread or app_loop is None:
+                fn()
+                return True
+            ready = threading.Event()
+
+            def _wrapped() -> None:
+                try:
+                    fn()
+                finally:
+                    ready.set()
+
+            try:
+                app_loop.call_soon_threadsafe(_wrapped)
+            except Exception:
+                return False
+            return ready.wait(timeout=5)
+
+        if not _run_on_app_loop(_setup_modal):
+            return self._prompt_text_input("Choice [1/2/3]: ")
 
         _last_countdown_refresh = _time.monotonic()
         try:
             while True:
                 try:
                     result = response_queue.get(timeout=1)
-                    self._slash_confirm_state = None
-                    self._slash_confirm_deadline = 0
-                    self._restore_modal_input_snapshot()
-                    self._invalidate()
+                    _run_on_app_loop(_teardown_modal)
                     return result
                 except queue.Empty:
                     remaining = self._slash_confirm_deadline - _time.monotonic()
@@ -7218,10 +7248,7 @@ class HermesCLI:
                         self._invalidate()
         finally:
             if self._slash_confirm_state is not None:
-                self._slash_confirm_state = None
-                self._slash_confirm_deadline = 0
-                self._restore_modal_input_snapshot()
-                self._invalidate()
+                _run_on_app_loop(_teardown_modal)
         return None
 
     def _submit_slash_confirm_response(self, value: str | None) -> None:
@@ -7559,8 +7586,19 @@ class HermesCLI:
         parts = cmd_original.split(None, 1)  # split off '/model'
         raw_args = parts[1].strip() if len(parts) > 1 else ""
 
-        # Parse --provider and --global flags
-        model_input, explicit_provider, persist_global = parse_model_flags(raw_args)
+        # Parse --provider, --global, and --refresh flags
+        model_input, explicit_provider, persist_global, force_refresh = parse_model_flags(raw_args)
+
+        # --refresh: wipe the on-disk picker cache before building the
+        # provider list. Forces a live re-fetch of every authed provider's
+        # /v1/models endpoint on this open.
+        if force_refresh:
+            try:
+                from hermes_cli.models import clear_provider_models_cache
+                clear_provider_models_cache()
+                _cprint("  Cleared model picker cache. Refreshing...")
+            except Exception:
+                pass
 
         # Single inventory context — replaces the inline config-slice the
         # dashboard / TUI used to duplicate. Overlay live session state
@@ -7599,6 +7637,7 @@ class HermesCLI:
                 _cprint("")
                 _cprint("  /model <name>                        switch model")
                 _cprint("  /model --provider <slug>             switch provider")
+                _cprint("  /model --refresh                     re-fetch live model lists")
                 return
 
             self._open_model_picker(
@@ -10640,7 +10679,8 @@ class HermesCLI:
         if not reqs.get("stt_available", reqs.get("stt_key_set")):
             raise RuntimeError(
                 "Voice mode requires an STT provider for transcription.\n"
-                "Option 1: pip install faster-whisper  (free, local)\n"
+                "Option 1: uv pip install faster-whisper  "
+                "(free, local; `pip install faster-whisper` also works if pip is on PATH)\n"
                 "Option 2: Set GROQ_API_KEY (free tier)\n"
                 "Option 3: Set VOICE_TOOLS_OPENAI_KEY (paid)"
             )
