@@ -8774,7 +8774,23 @@ class GatewayRunner:
         if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK:
             platform_name = source.platform.value
             env_key = _home_target_env_var(platform_name)
-            if not os.getenv(env_key):
+            # Skip the nag in Matrix free rooms — those are ambient watcher
+            # rooms where the bot is expected to listen broadly; the room
+            # IS the home for that context, so prompting for /sethome adds
+            # noise and is observed in stigmergic-consult runs to drop into
+            # every fresh thread. See matrix-hive/docs/specs/
+            # 2026-05-28-coordinator-ambient-watcher.md §3.3.
+            skip_free_room_nag = False
+            if source.platform == Platform.MATRIX:
+                matrix_adapter = self.adapters.get(Platform.MATRIX)
+                if matrix_adapter is not None and hasattr(matrix_adapter, "is_free_room"):
+                    try:
+                        skip_free_room_nag = bool(matrix_adapter.is_free_room(source.chat_id))
+                    except Exception:
+                        # Defensive: helper failures must never block the
+                        # nag — fall back to the existing emit.
+                        skip_free_room_nag = False
+            if not os.getenv(env_key) and not skip_free_room_nag:
                 # Slack dispatches all Hermes commands through a single
                 # parent slash command `/hermes`; bare `/sethome` is not
                 # registered and would fail with "app did not respond".

@@ -1102,6 +1102,15 @@ def load_gateway_config() -> GatewayConfig:
                     if isinstance(frc, list):
                         frc = ",".join(str(v) for v in frc)
                     os.environ["MATRIX_FREE_RESPONSE_ROOMS"] = str(frc)
+                # free_room_bot_blocklist: in free rooms, these MXIDs do NOT
+                # bypass require_mention (still need an @mention to engage).
+                # Anti-loop for multi-Hermes-profile rooms where peer-bots
+                # post but should not trigger ambient handlers.
+                frbb = matrix_cfg.get("free_room_bot_blocklist")
+                if frbb is not None and not os.getenv("MATRIX_FREE_ROOM_BOT_BLOCKLIST"):
+                    if isinstance(frbb, list):
+                        frbb = ",".join(str(v) for v in frbb)
+                    os.environ["MATRIX_FREE_ROOM_BOT_BLOCKLIST"] = str(frbb)
                 # allowed_rooms: if set, bot ONLY responds in these rooms (whitelist)
                 ar = matrix_cfg.get("allowed_rooms")
                 if ar is not None and not os.getenv("MATRIX_ALLOWED_ROOMS"):

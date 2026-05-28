@@ -18,6 +18,7 @@ Environment variables:
                             (eyes/checkmark/cross). Default: true
     MATRIX_REQUIRE_MENTION      Require @mention in rooms (default: true)
     MATRIX_FREE_RESPONSE_ROOMS  Comma-separated room IDs exempt from mention requirement (alias of matrix.free_response_rooms)
+    MATRIX_FREE_ROOM_BOT_BLOCKLIST  Comma-separated MXIDs that do NOT get the free-room mention bypass — anti-loop for peer Hermes-bot identities in shared free rooms (alias of matrix.free_room_bot_blocklist)
     MATRIX_ALLOWED_ROOMS    Comma-separated room IDs; if set, bot ONLY responds in these rooms (whitelist, DMs exempt; alias of matrix.allowed_rooms)
     MATRIX_AUTO_THREAD          Auto-create threads for room messages (default: true)
     MATRIX_DM_AUTO_THREAD       Auto-create threads for DM messages (default: false)
@@ -431,6 +432,26 @@ class MatrixAdapter(BasePlatformAdapter):
         else:
             self._free_rooms: Set[str] = {
                 r.strip() for r in str(free_rooms_raw).split(",") if r.strip()
+            }
+        # Anti-loop blocklist for free rooms: senders here do NOT bypass
+        # require_mention, even in a free room. Use to prevent cross-bot
+        # loops in multi-Hermes-profile rooms (e.g. coordinator listens
+        # ambiently in `colony-broadcast-private`; other hive bots posting
+        # there still need an @mention to engage coordinator).
+        # _is_system_or_bridge_sender already handles bridge identities;
+        # this blocklist is for known peer-bot MXIDs that aren't bridges.
+        # Opt-in via MATRIX_FREE_ROOM_BOT_BLOCKLIST=mxid1,mxid2 (default empty
+        # → existing free-room behavior preserved).
+        bot_blocklist_raw = config.extra.get("free_room_bot_blocklist")
+        if bot_blocklist_raw is None:
+            bot_blocklist_raw = os.getenv("MATRIX_FREE_ROOM_BOT_BLOCKLIST", "")
+        if isinstance(bot_blocklist_raw, list):
+            self._free_room_bot_blocklist: Set[str] = {
+                str(r).strip() for r in bot_blocklist_raw if str(r).strip()
+            }
+        else:
+            self._free_room_bot_blocklist: Set[str] = {
+                r.strip() for r in str(bot_blocklist_raw).split(",") if r.strip()
             }
         # If non-empty, bot ONLY responds in these rooms (whitelist); DMs exempt.
         allowed_rooms_raw = config.extra.get("allowed_rooms")
@@ -1601,6 +1622,16 @@ class MatrixAdapter(BasePlatformAdapter):
             return True
         return localpart.startswith("_")
 
+    def is_free_room(self, room_id: str) -> bool:
+        """Return True if room_id is in MATRIX_FREE_RESPONSE_ROOMS.
+
+        Public helper so the gateway runner can suppress per-chat onboarding
+        prompts (e.g. the ``/sethome`` nag) in rooms operating as ambient
+        watchers. The room IS the bot's home there — no additional channel
+        needs to be designated.
+        """
+        return bool(room_id) and room_id in self._free_rooms
+
     async def _on_room_message(self, event: Any) -> None:
         """Handle incoming room message events (text, media)."""
         room_id = str(getattr(event, "room_id", ""))
@@ -1778,15 +1809,34 @@ class MatrixAdapter(BasePlatformAdapter):
                 return None
 
             is_free_room = room_id in self._free_rooms
+            # Anti-loop: senders on the free-room blocklist (other hive bots,
+            # for example) do NOT get the free-room mention bypass — they
+            # still need an @mention to engage. Bridges/system identities
+            # are already filtered upstream by _is_system_or_bridge_sender;
+            # the blocklist covers peer-bot MXIDs that aren't bridges.
+            sender_in_free_room_blocklist = (
+                is_free_room and sender in self._free_room_bot_blocklist
+            )
+            ambient_bypass = is_free_room and not sender_in_free_room_blocklist
             in_bot_thread = bool(thread_id and thread_id in self._threads)
-            if self._require_mention and not is_free_room and not in_bot_thread:
+            if self._require_mention and not ambient_bypass and not in_bot_thread:
                 if not is_mentioned:
-                    logger.debug(
-                        "Matrix: ignoring message %s in %s — no @mention "
-                        "(set MATRIX_REQUIRE_MENTION=false to disable)",
-                        event_id,
-                        room_id,
-                    )
+                    if sender_in_free_room_blocklist:
+                        logger.debug(
+                            "Matrix: ignoring message %s in %s — sender %s on "
+                            "MATRIX_FREE_ROOM_BOT_BLOCKLIST, ambient bypass "
+                            "suppressed and no @mention",
+                            event_id,
+                            room_id,
+                            sender,
+                        )
+                    else:
+                        logger.debug(
+                            "Matrix: ignoring message %s in %s — no @mention "
+                            "(set MATRIX_REQUIRE_MENTION=false to disable)",
+                            event_id,
+                            room_id,
+                        )
                     return None
 
             # Thread-level @mention gating: even in a bot-participated thread,
