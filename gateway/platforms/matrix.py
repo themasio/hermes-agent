@@ -2605,7 +2605,9 @@ class MatrixAdapter(BasePlatformAdapter):
 
             # ----- TTS readback dispatch (🔊 → voice reply) ---------------
             # Spec: matrix-hive docs/superpowers/specs/2026-05-18-tts-readback-design.md §5.2
-            if self._readback_enabled and key == self._readback_emoji:
+            if getattr(self, "_readback_enabled", False) and key == getattr(
+                self, "_readback_emoji", None
+            ):
                 # Don't collide with approval-prompt flow (covered below).
                 approval = self._approval_prompts_by_event.get(reacts_to)
                 if approval is None or approval.resolved:
