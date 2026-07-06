@@ -21,7 +21,7 @@ from gateway.config import PlatformConfig
 
 def _make_adapter():
     """Create a MatrixAdapter with mocked config."""
-    from gateway.platforms.matrix import MatrixAdapter
+    from plugins.platforms.matrix.adapter import MatrixAdapter
 
     config = PlatformConfig(
         enabled=True,
@@ -176,7 +176,7 @@ def test_blocklist_defaults_empty(monkeypatch):
 
 def test_blocklist_parsed_from_extra():
     """Config extra (list form) is also accepted, mirroring free_rooms."""
-    from gateway.platforms.matrix import MatrixAdapter
+    from plugins.platforms.matrix.adapter import MatrixAdapter
 
     config = PlatformConfig(
         enabled=True,

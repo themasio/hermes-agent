@@ -25,7 +25,7 @@ except ImportError:
 def _make_adapter(readback_enabled: bool = True, emoji: str = "🔊",
                   max_chars: int = 2000, timeout: int = 30):
     """Create a MatrixAdapter with mocked config, readback configurable."""
-    from gateway.platforms.matrix import MatrixAdapter
+    from plugins.platforms.matrix.adapter import MatrixAdapter
     from gateway.config import PlatformConfig
 
     config = PlatformConfig(
@@ -100,7 +100,7 @@ def test_ctor_reads_readback_flag_true():
 
 
 def test_ctor_readback_flag_defaults_false_when_missing():
-    from gateway.platforms.matrix import MatrixAdapter
+    from plugins.platforms.matrix.adapter import MatrixAdapter
     from gateway.config import PlatformConfig
     config = PlatformConfig(
         enabled=True,
@@ -126,10 +126,10 @@ async def test_readback_happy_path_text():
 
     fake_tts_result = {"file_path": "/tmp/test.ogg", "duration_ms": 1234}
     with patch(
-        "gateway.platforms.matrix.text_to_speech_tool",
+        "plugins.platforms.matrix.adapter.text_to_speech_tool",
         return_value=fake_tts_result,
     ) as tts_mock, patch(
-        "gateway.platforms.matrix._strip_markdown_for_tts",
+        "plugins.platforms.matrix.adapter._strip_markdown_for_tts",
         side_effect=lambda t: t,
     ), patch("os.unlink"), patch("os.path.getsize", return_value=1234):
         await adapter._handle_readback_reaction(
@@ -177,10 +177,10 @@ async def test_readback_threaded_parent_inherits_thread():
 
     fake_tts_result = {"file_path": "/tmp/test.ogg", "duration_ms": 1234}
     with patch(
-        "gateway.platforms.matrix.text_to_speech_tool",
+        "plugins.platforms.matrix.adapter.text_to_speech_tool",
         return_value=fake_tts_result,
     ), patch(
-        "gateway.platforms.matrix._strip_markdown_for_tts",
+        "plugins.platforms.matrix.adapter._strip_markdown_for_tts",
         side_effect=lambda t: t,
     ), patch("os.unlink"), patch("os.path.getsize", return_value=1234):
         await adapter._handle_readback_reaction(
@@ -209,10 +209,10 @@ async def test_readback_main_timeline_parent_roots_new_thread():
 
     fake_tts_result = {"file_path": "/tmp/test.ogg", "duration_ms": 1234}
     with patch(
-        "gateway.platforms.matrix.text_to_speech_tool",
+        "plugins.platforms.matrix.adapter.text_to_speech_tool",
         return_value=fake_tts_result,
     ), patch(
-        "gateway.platforms.matrix._strip_markdown_for_tts",
+        "plugins.platforms.matrix.adapter._strip_markdown_for_tts",
         side_effect=lambda t: t,
     ), patch("os.unlink"), patch("os.path.getsize", return_value=1234):
         await adapter._handle_readback_reaction(
@@ -312,7 +312,7 @@ async def test_extract_image_with_caption_reads_caption():
     )
     fake_tts_result = {"file_path": "/tmp/test.ogg", "duration_ms": 1234}
     with patch(
-        "gateway.platforms.matrix.text_to_speech_tool",
+        "plugins.platforms.matrix.adapter.text_to_speech_tool",
         return_value=fake_tts_result,
     ) as tts_mock, patch("os.unlink"), patch("os.path.getsize", return_value=1234):
         await adapter._handle_readback_reaction(
@@ -332,7 +332,7 @@ async def test_extract_image_filename_only_skipped():
             msgtype="m.image",
         )
     )
-    with patch("gateway.platforms.matrix.text_to_speech_tool") as tts_mock:
+    with patch("plugins.platforms.matrix.adapter.text_to_speech_tool") as tts_mock:
         await adapter._handle_readback_reaction(
             "!room:example.org", "$parent_msg", "@alice:example.org"
         )
@@ -347,7 +347,7 @@ async def test_extract_audio_parent_skipped_silently():
     adapter._client.get_event = AsyncMock(
         return_value=_make_text_event(body="voice.ogg", msgtype="m.audio")
     )
-    with patch("gateway.platforms.matrix.text_to_speech_tool") as tts_mock:
+    with patch("plugins.platforms.matrix.adapter.text_to_speech_tool") as tts_mock:
         await adapter._handle_readback_reaction(
             "!room:example.org", "$parent_msg", "@alice:example.org"
         )
@@ -368,10 +368,10 @@ async def test_extract_html_formatted_body_strips_tags():
     )
     fake_tts_result = {"file_path": "/tmp/test.ogg", "duration_ms": 1234}
     with patch(
-        "gateway.platforms.matrix.text_to_speech_tool",
+        "plugins.platforms.matrix.adapter.text_to_speech_tool",
         return_value=fake_tts_result,
     ) as tts_mock, patch(
-        "gateway.platforms.matrix._strip_markdown_for_tts",
+        "plugins.platforms.matrix.adapter._strip_markdown_for_tts",
         side_effect=lambda t: t,
     ), patch("os.unlink"), patch("os.path.getsize", return_value=1234):
         await adapter._handle_readback_reaction(
@@ -394,7 +394,7 @@ async def test_markdown_stripped_before_tts(monkeypatch):
     # Use the real _strip_markdown_for_tts behavior to assert end-to-end.
     fake_tts_result = {"file_path": "/tmp/test.ogg", "duration_ms": 1234}
     with patch(
-        "gateway.platforms.matrix.text_to_speech_tool",
+        "plugins.platforms.matrix.adapter.text_to_speech_tool",
         return_value=fake_tts_result,
     ) as tts_mock, patch("os.unlink"), patch("os.path.getsize", return_value=1234):
         await adapter._handle_readback_reaction(
@@ -417,7 +417,7 @@ async def test_truncation_at_max_chars_adds_marker_reaction():
     )
     fake_tts_result = {"file_path": "/tmp/test.ogg", "duration_ms": 1234}
     with patch(
-        "gateway.platforms.matrix.text_to_speech_tool",
+        "plugins.platforms.matrix.adapter.text_to_speech_tool",
         return_value=fake_tts_result,
     ) as tts_mock, patch("os.unlink"), patch("os.path.getsize", return_value=1234):
         await adapter._handle_readback_reaction(
@@ -440,7 +440,7 @@ async def test_concurrent_readback_same_parent_only_runs_once():
         return_value=_make_text_event(body="hello")
     )
     with patch(
-        "gateway.platforms.matrix.text_to_speech_tool",
+        "plugins.platforms.matrix.adapter.text_to_speech_tool",
         return_value={"file_path": "/tmp/test.ogg", "duration_ms": 1234},
     ), patch("os.unlink"):
         # Pre-fill the lock to simulate a concurrent caller already running.
@@ -501,7 +501,7 @@ async def test_error_tts_timeout_adds_warning():
         return_value=_make_text_event(body="hello")
     )
     with patch(
-        "gateway.platforms.matrix.asyncio.to_thread",
+        "plugins.platforms.matrix.adapter.asyncio.to_thread",
         new=AsyncMock(side_effect=asyncio.TimeoutError()),
     ):
         await adapter._handle_readback_reaction(
@@ -524,7 +524,7 @@ async def test_error_send_voice_upload_403():
         side_effect=Exception("403 Forbidden: no permission to upload")
     )
     with patch(
-        "gateway.platforms.matrix.text_to_speech_tool",
+        "plugins.platforms.matrix.adapter.text_to_speech_tool",
         return_value={"file_path": "/tmp/test.ogg", "duration_ms": 1234},
     ), patch("os.unlink"), patch("os.path.getsize", return_value=1234):
         await adapter._handle_readback_reaction(
@@ -540,13 +540,13 @@ async def test_error_send_voice_upload_403():
 async def test_success_emits_observability_log(caplog):
     """Successful readback emits one INFO log line with metrics."""
     import logging as _logging
-    caplog.set_level(_logging.INFO, logger="gateway.platforms.matrix")
+    caplog.set_level(_logging.INFO, logger="plugins.platforms.matrix.adapter")
     adapter = _make_adapter(readback_enabled=True)
     adapter._client.get_event = AsyncMock(
         return_value=_make_text_event(body="hello world")
     )
     with patch(
-        "gateway.platforms.matrix.text_to_speech_tool",
+        "plugins.platforms.matrix.adapter.text_to_speech_tool",
         return_value={"file_path": "/tmp/test.ogg", "duration_ms": 4521},
     ), patch("os.unlink"), patch("os.path.getsize", return_value=1234):
         await adapter._handle_readback_reaction(
@@ -578,7 +578,7 @@ async def test_tts_result_json_string_is_parsed():
         "voice_compatible": False,
     })
     with patch(
-        "gateway.platforms.matrix.text_to_speech_tool",
+        "plugins.platforms.matrix.adapter.text_to_speech_tool",
         return_value=tts_json,
     ), patch("os.unlink"), patch("os.path.getsize", return_value=1234):
         await adapter._handle_readback_reaction(
@@ -600,7 +600,7 @@ async def test_tts_result_json_failure_surfaces_warning():
     )
     tts_json = _json.dumps({"success": False, "error": "no API key"})
     with patch(
-        "gateway.platforms.matrix.text_to_speech_tool",
+        "plugins.platforms.matrix.adapter.text_to_speech_tool",
         return_value=tts_json,
     ), patch("os.unlink"), patch("os.path.getsize", return_value=1234):
         await adapter._handle_readback_reaction(
